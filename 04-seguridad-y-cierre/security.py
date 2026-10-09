@@ -5,13 +5,15 @@ Diseño (defendible en el cierre oral):
 - Validación en el borde MCP, antes de tocar el dominio. Falla cerrado
   con ``ValidationError`` -> el servidor lo convierte en
   ``{"status": ..., "message": ...}`` accionable, sin trazas internas.
-- Confirmación human-in-the-loop con token opaco de un solo uso:
+- Confirmación human-in-the-loop con token opaco de un solo uso y dos
+  estados: emitido y aprobado por el host:
   el modelo NO puede inventar un ``confirmation_id`` válido porque es un
   token aleatorio (``secrets.token_urlsafe``) emitido por
   ``request_registration_confirmation`` y guardado sólo en el servidor,
   atado a un par (activity_id, student_email), con TTL y un solo uso.
   Un booleano ``confirmed=true`` nunca se acepta: sería falsificable
-  por el modelo.
+  por el modelo. Emitir el token no basta: sólo el adaptador confiable del
+  host puede marcarlo como aprobado tras recibir el "sí" de la persona.
 - Idempotencia en dos capas: el token es de un solo uso (reuso ->
   ``confirmation_reused``, no re-ejecuta) y el dominio tiene constraint
   único (activity, student_email) -> ``already_registered`` sin duplicar.
@@ -57,6 +59,10 @@ class ConfirmationExpired(ConfirmationRequired):
 
 class ConfirmationMismatch(ConfirmationRequired):
     """El confirmation_id no corresponde a este (activity_id, email)."""
+
+
+class ConfirmationPendingApproval(ConfirmationRequired):
+    """El host todavía no registró la aprobación humana."""
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +158,20 @@ class PendingConfirmation:
     created_at: datetime
     expires_at: datetime
     used: bool = False
+    approved_at: datetime | None = None
+    approved_by: str = ""
+
+
+@dataclass(frozen=True)
+class HostApproval:
+    """Aprobación que el adaptador confiable del host registró."""
+
+    activity_id: str
+    student_email: str
+    confirmation_id: str
+    approved_at: datetime
+    approved_by: str
+    newly_approved: bool
 
 
 class ConfirmationStore:
@@ -191,6 +211,73 @@ class ConfirmationStore:
             self.failure_reason(confirmation_id, activity_id, student_email)
             is None
         )
+
+    def approval_failure_reason(
+        self,
+        confirmation_id: str | None,
+        activity_id: str,
+        student_email: str,
+    ) -> ConfirmationRequired | None:
+        """Causa de rechazo para la acción mutable, incluida la aprobación."""
+        if not confirmation_id or not str(confirmation_id).strip():
+            return self.failure_reason(confirmation_id, activity_id, student_email)
+        with self._lock:
+            reason = self._check_locked(
+                str(confirmation_id).strip(), activity_id, student_email
+            )
+            if reason is not None:
+                return reason
+            pending = self._pending[str(confirmation_id).strip()]
+            if pending.approved_at is None:
+                return ConfirmationPendingApproval(
+                    "La solicitud está pendiente de aprobación humana en el host. "
+                    "Mostrá el resumen y esperá el 'sí' antes de inscribir."
+                )
+            return None
+
+    def approve_from_host(
+        self, confirmation_id: str | None, approved_by: str
+    ) -> HostApproval:
+        """Registra el sí humano desde código confiable del host.
+
+        Esta función no es una tool MCP. El adaptador del host debe invocarla
+        únicamente después de mostrar el resumen y obtener la aprobación.
+        """
+        token = str(confirmation_id or "").strip()
+        actor = str(approved_by or "").strip()
+        if not actor:
+            raise ValueError("approved_by es obligatorio para auditar la aprobación")
+        with self._lock:
+            pending = self._pending.get(token)
+            if pending is None or pending.used:
+                raise ConfirmationInvalid(
+                    "confirmation_id inválido o ya utilizado. "
+                    "Solicitá uno nuevo con `request_registration_confirmation`."
+                )
+            if datetime.now(timezone.utc) > pending.expires_at:
+                raise ConfirmationExpired(
+                    "La confirmación venció. "
+                    "Solicitá una nueva con `request_registration_confirmation`."
+                )
+            if pending.approved_at is not None:
+                return HostApproval(
+                    activity_id=pending.activity_id,
+                    student_email=pending.student_email,
+                    confirmation_id=token,
+                    approved_at=pending.approved_at,
+                    approved_by=pending.approved_by,
+                    newly_approved=False,
+                )
+            pending.approved_at = datetime.now(timezone.utc)
+            pending.approved_by = actor
+            return HostApproval(
+                activity_id=pending.activity_id,
+                student_email=pending.student_email,
+                confirmation_id=token,
+                approved_at=pending.approved_at,
+                approved_by=actor,
+                newly_approved=True,
+            )
 
     def failure_reason(
         self,
@@ -246,7 +333,9 @@ class ConfirmationStore:
         student_email: str,
     ) -> None:
         """Valida y marca el token como usado. Lanza ConfirmationRequired."""
-        reason = self.failure_reason(confirmation_id, activity_id, student_email)
+        reason = self.approval_failure_reason(
+            confirmation_id, activity_id, student_email
+        )
         if reason is not None:
             raise reason
         with self._lock:
@@ -256,7 +345,13 @@ class ConfirmationStore:
             )
             if reason is not None:
                 raise reason
-            self._pending[str(confirmation_id).strip()].used = True
+            pending = self._pending[str(confirmation_id).strip()]
+            if pending.approved_at is None:
+                raise ConfirmationPendingApproval(
+                    "La solicitud está pendiente de aprobación humana en el host. "
+                    "Mostrá el resumen y esperá el 'sí' antes de inscribir."
+                )
+            pending.used = True
 
 
 # Store global del proceso (el servidor MCP corre en un solo proceso stdio).
@@ -282,23 +377,24 @@ def is_host_confirmation_valid(
 ) -> bool:
     """Verifica una confirmación emitida por el host, no por el modelo.
 
-    Falla cerrado: ``None``/desconocido/usado/vencido/desatado -> ``False``.
+    Falla cerrado: ``None``/desconocido/usado/vencido/desatado/sin aprobación
+    del host -> ``False``.
     Cuando se conocen ``activity_id`` y ``student_email`` también se exige
-    el binding; sin ellos sólo se chequea existencia/vigencia (útil para
-    mensajes previos, nunca como única barrera: ``register`` siempre usa
-    ``consume`` con binding).
+    el binding; sin ellos se chequea existencia, vigencia y aprobación. Nunca
+    se usa como única barrera: ``register`` siempre usa ``consume`` con
+    binding.
     """
     if not confirmation_id:
         return False
     if activity_id is None or student_email is None:
         with confirmation_store._lock:
             pending = confirmation_store._pending.get(str(confirmation_id).strip())
-            if pending is None or pending.used:
+            if pending is None or pending.used or pending.approved_at is None:
                 return False
             return datetime.now(timezone.utc) <= pending.expires_at
-    return confirmation_store.peek_valid(
+    return confirmation_store.approval_failure_reason(
         str(confirmation_id).strip(), activity_id, student_email
-    )
+    ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +410,7 @@ class AuditEvent:
     confirmation_id: str = ""
     result: str = "ok"
     detail: str = ""
+    approved_by: str = ""
 
 
 def new_audit_event(
@@ -322,6 +419,7 @@ def new_audit_event(
     confirmation_id: str = "",
     result: str = "ok",
     detail: str = "",
+    approved_by: str = "",
 ) -> AuditEvent:
     return AuditEvent(
         activity_id=activity_id,
@@ -330,6 +428,7 @@ def new_audit_event(
         confirmation_id=confirmation_id,
         result=result,
         detail=detail,
+        approved_by=approved_by,
     )
 
 
@@ -358,6 +457,7 @@ class AuditLog:
                 "confirmation_id": event.confirmation_id,
                 "result": event.result,
                 "detail": event.detail,
+                "approved_by": event.approved_by,
             },
             ensure_ascii=False,
         )

@@ -26,6 +26,17 @@ Aplicá estas mejoras al servidor de la etapa 03:
 4. Revisá cada resource: debe devolver sólo la información necesaria y no filtrar datos sensibles.
 5. Conectá el servidor local por `stdio` desde el host y realizá una prueba de extremo a extremo.
 
+### Integración de aprobación del host
+
+`request_registration_confirmation` sólo emite una solicitud pendiente. El
+adaptador confiable del host debe mostrar su `summary`, obtener el "sí" de la
+persona y recién entonces llamar, desde código del host y no como tool MCP, a
+`approve_registration_confirmation_from_host(confirmation_id, approved_by)`.
+El identificador `approved_by` debe ser la cuenta o sesión autenticada que
+aceptó. Sin esa marca, `register_for_activity` devuelve
+`confirmation_invalid` y no modifica el dominio. La auditoría guarda el
+evento `confirmation_approved`, el momento y `approved_by`.
+
 Ejemplo conceptual de configuración local en OpenCode:
 
 ```json

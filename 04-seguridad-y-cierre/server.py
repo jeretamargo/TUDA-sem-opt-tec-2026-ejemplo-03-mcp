@@ -10,9 +10,10 @@ Capacidades:
 - Prompt `guia_inscripcion` — flujo guiado que orquesta lo anterior.
 
 Flujo exigido: modelo → `request_registration_confirmation` → el HOST
-muestra el resumen al humano y pide "sí, confirmo" → humano acepta →
-modelo llama `register_for_activity` con el `confirmation_id` → dominio →
-resultado → auditoría. El modelo jamás puede auto-confirmar.
+muestra el resumen al humano y pide "sí, confirmo" → el adaptador confiable
+del host registra la aprobación → modelo llama `register_for_activity` con el
+`confirmation_id` → dominio → resultado → auditoría. El modelo jamás puede
+auto-confirmar.
 """
 
 from mcp.server import MCPServer
@@ -26,6 +27,7 @@ from domain import (
 )
 from security import (
     AuditLog,
+    ConfirmationInvalid,
     ConfirmationRequired,
     ValidationError,
     confirmation_store,
@@ -39,6 +41,43 @@ from security import (
 
 mcp = MCPServer("Actividades seguras — laboratorio")
 audit_log = AuditLog()
+
+
+def approve_registration_confirmation_from_host(
+    confirmation_id: str, approved_by: str
+) -> dict[str, str]:
+    """Registra una aprobación humana desde el adaptador confiable del host.
+
+    No es una tool MCP deliberadamente: el modelo no debe poder invocarla.
+    El host debe llamarla sólo tras mostrar el resumen de la solicitud y
+    obtener una aceptación explícita. ``approved_by`` identifica la cuenta o
+    sesión del host que aprobó, para dejar evidencia auditable.
+    """
+    try:
+        approval = confirmation_store.approve_from_host(
+            confirmation_id, approved_by
+        )
+    except (ConfirmationInvalid, ValueError) as error:
+        return {"status": "confirmation_invalid", "message": str(error)}
+    except ConfirmationRequired as error:
+        return {"status": "confirmation_invalid", "message": str(error)}
+
+    if approval.newly_approved:
+        audit_log.record(
+            new_audit_event(
+                approval.activity_id,
+                approval.student_email,
+                confirmation_id=approval.confirmation_id,
+                result="confirmation_approved",
+                approved_by=approval.approved_by,
+            )
+        )
+    return {
+        "status": "confirmation_approved",
+        "confirmation_id": approval.confirmation_id,
+        "approved_at": approval.approved_at.isoformat(),
+        "approved_by": approval.approved_by,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +225,9 @@ def request_registration_confirmation(
         ),
         "next_step": (
             "Mostrá este resumen al humano y pedí '¿Confirmás?'. "
-            "Sólo con su 'sí' llamá a `register_for_activity` con este "
-            "confirmation_id. Vence en 10 minutos y es de un solo uso."
+            "El adaptador confiable del host debe registrar ese 'sí' antes de "
+            "llamar a `register_for_activity` con este confirmation_id. "
+            "Vence en 10 minutos y es de un solo uso."
         ),
     }
 
@@ -216,9 +256,9 @@ def register_for_activity(
         return {"status": "invalid_email", "message": str(error)}
 
     # Puerta de la etapa 04: la confirmación debe venir del host, no del
-    # modelo. is_host_confirmation_valid() falla cerrado ante token
-    # ausente, inválido, vencido, reusado o desatado; consume() además lo
-    # reclama (un solo uso) de forma atómica.
+    # modelo. is_host_confirmation_valid() falla cerrado ante token ausente,
+    # inválido, pendiente de aprobación, vencido, reusado o desatado;
+    # consume() además lo reclama (un solo uso) de forma atómica.
     try:
         require_human_confirmation(
             is_host_confirmation_valid(
@@ -231,7 +271,7 @@ def register_for_activity(
     except ConfirmationRequired:
         # La puerta falló: clasificar la causa (sin mutar) para devolver
         # un mensaje específico y accionable en vez de uno genérico.
-        cause = confirmation_store.failure_reason(
+        cause = confirmation_store.approval_failure_reason(
             confirmation_id, safe_activity_id, safe_email
         ) or ConfirmationRequired(
             "Se requiere confirmación antes de inscribir. "
@@ -343,7 +383,7 @@ def guia_inscripcion(
             "Esta tool NO inscribe: devuelve un `confirmation_id` y un resumen.",
             "5. Mostrá el resumen al HUMANO en el host y pedí aprobación explícita ('¿Confirmás la inscripción a X con email Y?'). "
             "NUNCA inventes el `confirmation_id`: sólo vale el token opaco devuelto en el paso 4.",
-            "6. Recién con el 'sí' del humano, llamá a `register_for_activity` con `activity_id`, `student_email` y ese `confirmation_id`.",
+            "6. Recién con el 'sí' del humano y la aprobación registrada por el adaptador del host, llamá a `register_for_activity` con `activity_id`, `student_email` y ese `confirmation_id`.",
             "7. Comunicá el resultado: `registered` (celebralo con el ID), `already_registered` (ya estaba, sin duplicar), "
             "`activity_full` / `activity_not_found` / `invalid_email` / `confirmation_*` (explicá causa y ofrecé alternativas del catálogo).",
             "",
